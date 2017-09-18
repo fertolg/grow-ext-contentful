@@ -12,6 +12,6 @@ setup(
         'contentful_ext',
     ],
     install_requires=[
-        'contentful.py==0.9.3',
+        'contentful==1.3.0',
     ],
 )

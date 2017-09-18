@@ -1,5 +1,4 @@
-from contentful.cda import client
-from contentful.cda import resources
+import contentful
 from grow.common import utils
 from protorpc import messages
 import grow
@@ -20,6 +19,7 @@ class ContentfulPreprocessor(grow.Preprocessor):
     KIND = 'contentful'
     _edit_entry_url_format = 'https://app.contentful.com/spaces/{space}/entries/{entry}'
     _edit_space_url_format = 'https://app.contentful.com/spaces/{space}/entries'
+    _cdn_endpoint = 'cdn.contentful.com'
     _preview_endpoint = 'preview.contentful.com'
 
     class Config(messages.Message):
@@ -28,49 +28,70 @@ class ContentfulPreprocessor(grow.Preprocessor):
         bind = messages.MessageField(BindingMessage, 4, repeated=True)
 
     def _parse_field(self, field):
-        if isinstance(field, resources.Asset):
-            return field.url
-        elif isinstance(field, resources.Entry):
-            return field.sys['id']
-        elif isinstance(field, resources.ResourceLink):
-            return self.cda.resolve_resource_link(field)
+        if isinstance(field, contentful.Asset):
+            return field.url()
+        elif isinstance(field, contentful.Entry):
+            fields, body, basename = self._parse_entry(field, doc_fields=False)
+            return fields
+        elif isinstance(field, contentful.Link):
+            return self._parse_field(field.resolve(self.client))
         elif isinstance(field, list):
             return [self._parse_field(sub_field) for sub_field in field]
         return field
 
-    def _parse_entry(self, entry):
+    def _parse_entry(self, entry, doc_fields=True):
         """Parses an entry from Contentful."""
-        body = entry.fields.pop('body', None)
-        fields = entry.fields
-        for key, field in entry.fields.iteritems():
-          entry.fields[key] = self._parse_field(field)
+        locales = self.locales
+        entry_fields = entry.fields()
+        content_type = next(content_type
+                            for content_type
+                            in self.content_types
+                            if content_type.id == entry.content_type.id)
+        parsed_fields = {}
+        body = entry_fields.pop('body', None)
+        for key, field in entry_fields.iteritems():
+            field_localized = next((field_schema.localized for field_schema in content_type.fields if field_schema.id == key), False)
+            key = self._sanitize_key(key) if doc_fields else key
+            if field_localized:
+                key = '{}@'.format(key)
+            parsed_fields[key] = self._parse_field(field)
+        for locale in locales:
+            for key, field in entry.fields(locale).iteritems():
+                key = self._sanitize_key(key) if doc_fields else key
+                key = '{}@{}'.format(key, locale)
+                parsed_fields[key] = self._parse_field(field)
         if body:
             body = body
             ext = 'md'
         else:
             body = ''
             ext = 'yaml'
-        if 'title' in entry.fields:
-            entry.fields['$title'] = entry.fields.pop('title')
-        if 'slug' in entry.fields:
-            entry.fields['$slug'] = entry.fields.pop('slug')
-        if 'category' in entry.fields:
-            category = entry.fields.pop('category')
-            entry.fields['$category'] = category
         basename = '{}.{}'.format(entry.sys['id'], ext)
         if isinstance(body, unicode):
             body = body.encode('utf-8')
-        return fields, body, basename
+        return parsed_fields, body, basename
 
-    def bind_collection(self, entries, collection_pod_path, contentful_model):
+    def _sanitize_key(self, key):
+        if key == 'title':
+            return '$title'
+        if key == 'slug':
+            return '$slug'
+        if key == 'category':
+            return '$category'
+        return key
+
+    def bind_collection(self, collection_pod_path, contentful_model):
         """Binds a Grow collection to a Contentful collection."""
+        entries = self.client.entries({
+            'content_type': contentful_model,
+            'locale': '*',
+            'include': 10
+        })
         collection = self.pod.get_collection(collection_pod_path)
         existing_pod_paths = [
             doc.pod_path for doc in collection.list_docs(recursive=False, inject=False)]
         new_pod_paths = []
         for i, entry in enumerate(entries):
-            if entry.sys['contentType']['sys']['id'] != contentful_model:
-                continue
             fields, body, basename = self._parse_entry(entry)
             # TODO: Ensure `create_doc` doesn't die if the file doesn't exist.
             path = os.path.join(collection.pod_path, basename)
@@ -85,22 +106,29 @@ class ContentfulPreprocessor(grow.Preprocessor):
             self.pod.logger.info('Deleted -> {}'.format(pod_path))
 
     def run(self, *args, **kwargs):
-        entries = self.cda.fetch(resources.Entry).all()
+        self.content_types = self.client.content_types()
+        self.locales = [locale.code for locale in self.client.space().locales if not locale.default]
         for binding in self.config.bind:
-            self.bind_collection(entries, binding.collection,
+            self.bind_collection(binding.collection,
                                  binding.contentModel)
 
     @property
     @utils.memoize
-    def cda(self):
+    def client(self):
         """Contentful API client."""
         endpoint = None
         token = self.config.keys.production
+        endpoint = ContentfulPreprocessor._cdn_endpoint
         # Use preview endpoint if preview key is provided.
         if self.config.keys.preview:
             token = self.config.keys.preview
             endpoint = ContentfulPreprocessor._preview_endpoint
-        return client.Client(self.config.space, token, endpoint=endpoint)
+        return contentful.Client(
+            self.config.space,
+            token,
+            api_url=endpoint,
+            default_locale='zh'
+        )
 
     def can_inject(self, doc=None, collection=None):
         if not self.injected:
@@ -120,10 +148,9 @@ class ContentfulPreprocessor(grow.Preprocessor):
         injected. If collection is provided, returns a list of injected
         document instances."""
         if doc is not None:
-            query = {'sys.id': doc.base}
-            entry = self.cda.fetch(resources.Entry).where(query).first()
+            entry = self.client.entry(doc.base, {'locale': '*', 'include': 10})
             if not entry:
-                self.pod.logger.info('Contentful entry not found: {}'.format(query))
+                self.pod.logger.info('Contentful entry not found: {}'.format(doc.base))
                 return  # Corresponding doc not found in Contentful.
             fields, body, basename = self._parse_entry(entry)
             if isinstance(body, unicode):
@@ -131,7 +158,11 @@ class ContentfulPreprocessor(grow.Preprocessor):
             doc.inject(fields=fields, body=body)
             return doc
         elif collection is not None:
-            entries = self.cda.fetch(resources.Entry).all()
+            entries = self.client.entries({
+                'content_type': contentful_model,
+                'locale': '*',
+                'include': 10
+            })
             docs = []
             for binding in self.config.bind:
                 if (self._normalize_path(collection.pod_path)
@@ -144,8 +175,6 @@ class ContentfulPreprocessor(grow.Preprocessor):
     def create_doc_instances(self, entries, collection, contentful_model):
         docs = []
         for i, entry in enumerate(entries):
-            if entry.sys['contentType']['sys']['id'] != contentful_model:
-                continue
             fields, body, basename = self._parse_entry(entry)
             pod_path = os.path.join(collection.pod_path, basename)
             doc = collection.get_doc(pod_path)
